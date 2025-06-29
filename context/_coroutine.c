@@ -81,8 +81,15 @@ static void *coroutine_wrapper(void *action_, void *arg_)
 
     /* New coroutine gets a brand new Python interpreter stack frame. */
 #if PY_VERSION_HEX >= 0x30B0000
-    PyThreadState *new_threadstate = PyThreadState_New(thread_state->interp);
-    thread_state = PyThreadState_Swap(new_threadstate);
+    // PyThreadState *new_threadstate = PyThreadState_New(thread_state->interp);
+    // thread_state = PyThreadState_Swap(new_threadstate);
+    // PyThreadState_Clear(thread_state);
+    thread_state->cframe->current_frame = NULL;
+    thread_state->datastack_chunk = NULL;
+    thread_state->datastack_top = NULL;
+    thread_state->datastack_limit = NULL;
+    // thread_state->recursion_remaining = 100;
+    thread_state->exc_state.exc_value = NULL;
 #else
     thread_state->frame = NULL;
     thread_state->recursion_depth = 0;
@@ -108,9 +115,9 @@ static void *coroutine_wrapper(void *action_, void *arg_)
 
 
 #if PY_VERSION_HEX >= 0x30B0000
-    new_threadstate = PyThreadState_Swap(thread_state);
-    PyThreadState_Clear(new_threadstate);
-    PyThreadState_Delete(new_threadstate);
+    // new_threadstate = PyThreadState_Swap(thread_state);
+    PyThreadState_Clear(thread_state);
+    PyThreadState_Delete(thread_state);
 #else
     /* Some of the stuff we've initialised can leak through, so far I've only
      * seen exc_type still set at this point, but maybe other fields can also
@@ -162,19 +169,30 @@ static PyObject *coroutine_switch(PyObject *Self, PyObject *args)
     {
         PyThreadState *thread_state = PyThreadState_GET();
 
-#if PY_VERSION_HEX < 0x30B0000
-        /* Need to switch the Python interpreter's record of recursion depth and
-         * top frame around as we switch frames, otherwise the interpreter gets
-         * confused and thinks we've recursed too deep.  In truth tracking this
-         * stuff is the only reason this code is in a Python extension! */
+    /* Need to switch the Python interpreter's record of recursion depth and
+        * top frame around as we switch frames, otherwise the interpreter gets
+        * confused and thinks we've recursed too deep.  In truth tracking this
+        * stuff is the only reason this code is in a Python extension! */
+    #if PY_VERSION_HEX >= 0x30B0000
+        int recursion_depth = thread_state->recursion_limit - thread_state->recursion_remaining;
+        struct _PyInterpreterFrame *current_frame = thread_state->cframe->current_frame;
+        _PyStackChunk *datastack_chunk = thread_state->datastack_chunk;
+        PyObject **datastack_top = thread_state->datastack_top;
+        PyObject **datastack_limit = thread_state->datastack_limit;
+        PyFrameObject *frame = PyThreadState_GetFrame((PyThreadState *)thread_state);
+        Py_XDECREF(frame);
+    #else
         struct _frame *python_frame = thread_state->frame;
         int recursion_depth = thread_state->recursion_depth;
+    #endif
 
         /* We also need to switch the exception state around: if we don't do
          * this then we get confusion about the lifetime of exception state
          * between coroutines.  The most obvious problem is that the exception
          * isn't properly cleared on function return. */
-    #if PY_VERSION_HEX >= 0x03070000
+    #if PY_VERSION_HEX >= 0x30B0000
+        PyObject *exc_value = thread_state->exc_state.exc_value;
+    #elif PY_VERSION_HEX >= 0x03070000
         _PyErr_StackItem exc_state = thread_state->exc_state;
         _PyErr_StackItem *exc_info = thread_state->exc_info;
     #else
@@ -182,7 +200,6 @@ static PyObject *coroutine_switch(PyObject *Self, PyObject *args)
         PyObject *exc_value = thread_state->exc_value;
         PyObject *exc_traceback = thread_state->exc_traceback;
     #endif
-#endif
 
         /* Switch to new coroutine.  For the duration arg needs an extra
          * reference count, it'll be accounted for either on the next returned
@@ -190,12 +207,19 @@ static PyObject *coroutine_switch(PyObject *Self, PyObject *args)
         Py_INCREF(arg);
         PyObject *result = switch_cocore(target, arg);
 
+        // /* Restore previously saved state.  I wonder if PyThreadState_GET()
+        //  * really needs to be called again here...  Dont think so?*/
+        // thread_state = PyThreadState_GET();
+
 #if PY_VERSION_HEX >= 0x30B0000
-        PyThreadState_Swap(thread_state);
-#else
-        /* Restore previously saved state.  I wonder if PyThreadState_GET()
-         * really needs to be called again here... */
-        thread_state = PyThreadState_GET();
+        thread_state->recursion_remaining = thread_state->recursion_limit - recursion_depth;
+        thread_state->cframe->current_frame = current_frame;
+        thread_state->datastack_chunk = datastack_chunk;
+        thread_state->datastack_top = datastack_top;
+        thread_state->datastack_limit = datastack_limit;
+        thread_state->exc_state.exc_value = exc_value;
+        frame = NULL; //dont think this is doing anything
+#elif PY_VERSION_HEX < 0x30B0000
         thread_state->frame = python_frame;
         thread_state->recursion_depth = recursion_depth;
         /* Restore the exception state. */
